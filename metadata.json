@@ -1,0 +1,6 @@
+{
+  "name": "FiscalObra Pro",
+  "description": "Sistema de Fiscalização de Obras Públicas, Gestão Contratual, Medições, Diário de Obras (RDO), Não Conformidades e Processos de Pagamento GEFISPAG.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
