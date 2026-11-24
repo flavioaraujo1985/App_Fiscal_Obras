@@ -1,3 +1,4 @@
+import { cloudDatabase } from '../services/cloudDatabase';
 import dayjs from 'dayjs';
 import { create } from 'zustand';
 import { INITIAL_SEED_DATA } from '../data/seedData';
@@ -239,11 +240,14 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       );
     }
     if (typeof navigator === 'undefined' || navigator.onLine) {
-      api.saveDatabase(nextDb).catch(() => {
-        // Offline or server unavailable; data remains safely persisted locally on device
-      });
-    }
-  };
+  cloudDatabase.save(nextDb).catch(() => {
+    // Falha na sincronização com a nuvem.
+  });
+
+  api.saveDatabase(nextDb).catch(() => {
+    // Compatibilidade com backend atual.
+  });
+}
 
   return {
     db: INITIAL_SEED_DATA,
