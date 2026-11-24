@@ -241,11 +241,11 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
     }
     if (typeof navigator === 'undefined' || navigator.onLine) {
   cloudDatabase.save(nextDb).catch(() => {
-    // Falha na sincronização com a nuvem.
+    // Falha na sincronização com Supabase
   });
 
   api.saveDatabase(nextDb).catch(() => {
-    // Compatibilidade com backend atual.
+    // Compatibilidade com backend atual
   });
 }
 
