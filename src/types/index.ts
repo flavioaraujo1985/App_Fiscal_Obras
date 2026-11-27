@@ -167,7 +167,13 @@ export type CategoriaFoto =
   | 'INSTALAÇÕES'
   | 'PAVIMENTAÇÃO'
   | 'COBERTURA'
-  | 'ACABAMENTO';
+  | 'REVESTIMENTO/ACABAMENTO'
+  | 'PISOS'
+  | 'PINTURA'
+  | 'SERVIÇOS PRELIMINARES' 
+  | 'CERCAS'
+  | 'SERVIÇOS DIVERSOS'
+  | 'ESQUADRIAS';
 
 export interface FotoMedicao {
   id: string;
@@ -365,8 +371,8 @@ export interface PlanoAcao {
   howMuch: string;
 }
 
-export type TipoEvidencia = 'FOTO' | 'VIDEO' | 'PDF' | 'ATA' | 'OFICIO' | 'MEMORIAL';
-
+export type TipoEvidencia = 'FOTO' | 'VIDEO' | 'PDF' | 'ATA' | 'OFICIO' | 'MEMORIAL' | 'OUTROS';
+tipoPersonalizado?: string;
 export interface Evidencia {
   id: string;
   ncId: string;
