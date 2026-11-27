@@ -160,7 +160,10 @@ interface FiscalState {
   deleteNaoConformidade: (id: string) => Promise<void>;
   updateNcStatus: (id: string, status: StatusNC, observacao: string) => Promise<void>;
   saveNcPlanoAcao: (id: string, plano: PlanoAcao) => Promise<void>;
-  addNcEvidencia: (id: string, evidencia: Omit<NaoConformidade['evidencias'][number], 'id' | 'ncId'>) => Promise<void>;
+  addNcEvidencia: (
+    id: string,
+    evidencia: Omit<NaoConformidade['evidencias'][number], 'id' | 'ncId'>
+  ) => Promise<void>;
   updateNcEvidencia: (
     ncId: string,
     evidenciaId: string,
@@ -209,6 +212,43 @@ interface FiscalState {
   updateConfiguracoes: (cfg: ConfiguracoesSistema) => Promise<void>;
 }
 
+function makeId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function sanitizeNonNegativeNumber(value: unknown, fallback = 0): number {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num < 0) return fallback;
+  return Number(num.toFixed(2));
+}
+
+function clampPercent(value: unknown): number {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  return Math.max(0, Math.min(100, num));
+}
+
+async function safeDeleteLocalFile(url?: string): Promise<void> {
+  if (!url || !isLocalFileUrl(url)) return;
+  try {
+    await deviceStorage.deleteFile(extractLocalFileId(url));
+  } catch {
+    // Arquivo já removido ou inacessível localmente; não bloqueia a operação
+  }
+}
+
+function recalcularPercentuaisMedicoesContrato(
+  medicoes: Medicao[],
+  contratoId: string,
+  novoValorAtual: number
+): Medicao[] {
+  return medicoes.map((m) =>
+    m.contratoId === contratoId
+      ? { ...m, percentual: percentualExecutado(novoValorAtual, m.valor) }
+      : m
+  );
+}
+
 function makeAudit(
   usuario: string,
   acao: string,
@@ -217,7 +257,7 @@ function makeAudit(
   detalhes: string
 ): Auditoria {
   return {
-    id: `aud-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    id: makeId('aud'),
     usuario,
     data: dayjs().format('YYYY-MM-DD'),
     acao,
@@ -228,6 +268,8 @@ function makeAudit(
 }
 
 export const useFiscalStore = create<FiscalState>((set, get) => {
+  const toastTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
   const persist = async (nextDb: FiscalDatabase) => {
     set({ db: nextDb });
     try {
@@ -240,7 +282,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
     }
     if (typeof navigator === 'undefined' || navigator.onLine) {
       api.saveDatabase(nextDb).catch(() => {
-        // Offline or server unavailable; data remains safely persisted locally on device
+        // Offline ou servidor indisponível; dados mantidos localmente no dispositivo
       });
     }
   };
@@ -266,7 +308,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           try {
             initialDb = await api.getDatabase();
           } catch {
-            // Fallback to built-in seed when offline
+            // Fallback para seed embutido quando offline
           }
         }
         await deviceStorage.saveDatabaseLocal(initialDb);
@@ -283,15 +325,23 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
     setSelectedContratoId: (id) => set({ selectedContratoId: id }),
 
     pushToast: (tipo, texto) => {
-      const id = `toast-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
+      const id = makeId('toast');
       set((s) => ({ toasts: [...s.toasts, { id, tipo, texto }] }));
-      setTimeout(() => {
+      const timer = setTimeout(() => {
+        toastTimers.delete(id);
         get().dismissToast(id);
       }, 4200);
+      toastTimers.set(id, timer);
     },
 
-    dismissToast: (id) =>
-      set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
+    dismissToast: (id) => {
+      const timer = toastTimers.get(id);
+      if (timer) {
+        clearTimeout(timer);
+        toastTimers.delete(id);
+      }
+      set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
+    },
 
     resetDatabase: async () => {
       await deviceStorage.clearAllFiles();
@@ -320,10 +370,12 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
 
     addContrato: async (input) => {
       const { db } = get();
+      const valorInicialSanitizado = sanitizeNonNegativeNumber(input.valorInicial);
       const novo: Contrato = {
         ...input,
-        id: `ctr-${Date.now()}`,
-        valorAtual: input.valorInicial,
+        id: makeId('ctr'),
+        valorInicial: valorInicialSanitizado,
+        valorAtual: valorInicialSanitizado,
       };
       const audit = makeAudit(
         db.configuracoes.fiscalPadrao,
@@ -345,20 +397,34 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const { db } = get();
       const alvo = db.contratos.find((c) => c.id === id);
       if (!alvo) return;
+
       const valoresAditivos = db.aditivos
         .filter((a) => a.contratoId === id && a.tipo === 'VALOR')
         .map((a) => a.valor);
+
       const nextValorInicial =
-        patch.valorInicial !== undefined ? patch.valorInicial : alvo.valorInicial;
+        patch.valorInicial !== undefined
+          ? sanitizeNonNegativeNumber(patch.valorInicial, alvo.valorInicial)
+          : alvo.valorInicial;
+
       const nextValorAtual =
         patch.valorAtual !== undefined
-          ? patch.valorAtual
+          ? sanitizeNonNegativeNumber(patch.valorAtual, alvo.valorAtual)
           : patch.valorInicial !== undefined
           ? valorAtualizado(nextValorInicial, valoresAditivos)
           : alvo.valorAtual;
+
       const contratos = db.contratos.map((c) =>
-        c.id === id ? { ...c, ...patch, valorInicial: nextValorInicial, valorAtual: nextValorAtual } : c
+        c.id === id
+          ? { ...c, ...patch, valorInicial: nextValorInicial, valorAtual: nextValorAtual }
+          : c
       );
+
+      const medicoes =
+        nextValorAtual !== alvo.valorAtual
+          ? recalcularPercentuaisMedicoesContrato(db.medicoes, id, nextValorAtual)
+          : db.medicoes;
+
       const audit = makeAudit(
         db.configuracoes.gestorPadrao,
         'EDICAO_CONTRATO',
@@ -366,7 +432,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
         id,
         `Dados do Contrato ${patch.numero ?? alvo.numero} atualizados.`
       );
-      await persist({ ...db, contratos, auditoria: [audit, ...db.auditoria] });
+      await persist({ ...db, contratos, medicoes, auditoria: [audit, ...db.auditoria] });
       get().pushToast('success', 'Contrato atualizado.');
     },
 
@@ -381,7 +447,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       }
       for (const m of db.medicoes) {
         if (m.contratoId !== id) continue;
-        if (isLocalFileUrl(m.notaFiscal?.arquivoUrl) && m.notaFiscal?.arquivoUrl) {
+        if (m.notaFiscal?.arquivoUrl && isLocalFileUrl(m.notaFiscal.arquivoUrl)) {
           urlsParaRemover.add(m.notaFiscal.arquivoUrl);
         }
         for (const f of m.fotos) {
@@ -401,18 +467,16 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
         }
       }
       for (const p of db.processosGefispag) {
-        if (p.contratoId === id && isLocalFileUrl(p.notaFiscalInfo?.arquivoUrl) && p.notaFiscalInfo?.arquivoUrl) {
+        if (
+          p.contratoId === id &&
+          p.notaFiscalInfo?.arquivoUrl &&
+          isLocalFileUrl(p.notaFiscalInfo.arquivoUrl)
+        ) {
           urlsParaRemover.add(p.notaFiscalInfo.arquivoUrl);
         }
       }
 
-      for (const url of urlsParaRemover) {
-        try {
-          await deviceStorage.deleteFile(extractLocalFileId(url));
-        } catch {
-          // Non-fatal if local file was already removed
-        }
-      }
+      await Promise.all([...urlsParaRemover].map((url) => safeDeleteLocalFile(url)));
 
       const audit = makeAudit(
         db.configuracoes.gestorPadrao,
@@ -460,10 +524,12 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const existentes = db.aditivos.filter((a) => a.contratoId === input.contratoId);
       const novo: Aditivo = {
         ...input,
-        id: `adt-${Date.now()}`,
+        id: makeId('adt'),
         numero: existentes.length + 1,
       };
       const aditivos = [...db.aditivos, novo];
+      let novoValorAtual = 0;
+
       const contratos = db.contratos.map((c) => {
         if (c.id !== input.contratoId) return c;
         const valores = aditivos
@@ -473,12 +539,19 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           novo.tipo === 'PRAZO' && novo.dias > 0
             ? dayjs(c.dataFim).add(novo.dias, 'day').format('YYYY-MM-DD')
             : c.dataFim;
+        novoValorAtual = valorAtualizado(c.valorInicial, valores);
         return {
           ...c,
-          valorAtual: valorAtualizado(c.valorInicial, valores),
+          valorAtual: novoValorAtual,
           dataFim: novaDataFim,
         };
       });
+
+      const medicoes =
+        novo.tipo === 'VALOR'
+          ? recalcularPercentuaisMedicoesContrato(db.medicoes, input.contratoId, novoValorAtual)
+          : db.medicoes;
+
       const audit = makeAudit(
         db.configuracoes.gestorPadrao,
         'REGISTRO_ADITIVO',
@@ -486,7 +559,13 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
         novo.id,
         `Termo Aditivo nº ${novo.numero} (${novo.tipo}) registrado.`
       );
-      await persist({ ...db, aditivos, contratos, auditoria: [audit, ...db.auditoria] });
+      await persist({
+        ...db,
+        aditivos,
+        contratos,
+        medicoes,
+        auditoria: [audit, ...db.auditoria],
+      });
       get().pushToast('success', `Aditivo nº ${novo.numero} registrado.`);
     },
 
@@ -496,13 +575,23 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       if (!alvo) return;
       const atualizado: Aditivo = { ...alvo, ...patch };
       const aditivos = db.aditivos.map((a) => (a.id === id ? atualizado : a));
+      let novoValorAtual = 0;
+
       const contratos = db.contratos.map((c) => {
         if (c.id !== alvo.contratoId) return c;
         const valores = aditivos
           .filter((a) => a.contratoId === c.id && a.tipo === 'VALOR')
           .map((a) => a.valor);
-        return { ...c, valorAtual: valorAtualizado(c.valorInicial, valores) };
+        novoValorAtual = valorAtualizado(c.valorInicial, valores);
+        return { ...c, valorAtual: novoValorAtual };
       });
+
+      const medicoes = recalcularPercentuaisMedicoesContrato(
+        db.medicoes,
+        alvo.contratoId,
+        novoValorAtual
+      );
+
       const audit = makeAudit(
         db.configuracoes.gestorPadrao,
         'EDICAO_ADITIVO',
@@ -510,7 +599,13 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
         id,
         `Termo Aditivo nº ${atualizado.numero} (${atualizado.tipo}) editado.`
       );
-      await persist({ ...db, aditivos, contratos, auditoria: [audit, ...db.auditoria] });
+      await persist({
+        ...db,
+        aditivos,
+        contratos,
+        medicoes,
+        auditoria: [audit, ...db.auditoria],
+      });
       get().pushToast('success', `Aditivo nº ${atualizado.numero} atualizado.`);
     },
 
@@ -519,13 +614,23 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const alvo = db.aditivos.find((a) => a.id === id);
       if (!alvo) return;
       const aditivos = db.aditivos.filter((a) => a.id !== id);
+      let novoValorAtual = 0;
+
       const contratos = db.contratos.map((c) => {
         if (c.id !== alvo.contratoId) return c;
         const valores = aditivos
           .filter((a) => a.contratoId === c.id && a.tipo === 'VALOR')
           .map((a) => a.valor);
-        return { ...c, valorAtual: valorAtualizado(c.valorInicial, valores) };
+        novoValorAtual = valorAtualizado(c.valorInicial, valores);
+        return { ...c, valorAtual: novoValorAtual };
       });
+
+      const medicoes = recalcularPercentuaisMedicoesContrato(
+        db.medicoes,
+        alvo.contratoId,
+        novoValorAtual
+      );
+
       const audit = makeAudit(
         db.configuracoes.gestorPadrao,
         'EXCLUSAO_ADITIVO',
@@ -533,13 +638,19 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
         id,
         `Termo Aditivo nº ${alvo.numero} (${alvo.tipo}) excluído.`
       );
-      await persist({ ...db, aditivos, contratos, auditoria: [audit, ...db.auditoria] });
+      await persist({
+        ...db,
+        aditivos,
+        contratos,
+        medicoes,
+        auditoria: [audit, ...db.auditoria],
+      });
       get().pushToast('info', `Aditivo nº ${alvo.numero} excluído.`);
     },
 
     addGarantia: async (input) => {
       const { db } = get();
-      const nova: Garantia = { ...input, id: `gar-${Date.now()}` };
+      const nova: Garantia = { ...input, id: makeId('gar') };
       const contratos = db.contratos.map((c) =>
         c.id === input.contratoId
           ? { ...c, checklist: { ...c.checklist, garantia: true } }
@@ -573,7 +684,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
 
     addDocumento: async (input) => {
       const { db } = get();
-      const novo: Documento = { ...input, id: `doc-${Date.now()}` };
+      const novo: Documento = { ...input, id: makeId('doc') };
       await persist({ ...db, documentos: [novo, ...db.documentos] });
       get().pushToast('success', `Documento "${novo.nome}" anexado.`);
     },
@@ -582,12 +693,8 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const { db } = get();
       const alvo = db.documentos.find((d) => d.id === id);
       if (!alvo) return;
-      if (patch.url && patch.url !== alvo.url && isLocalFileUrl(alvo.url)) {
-        try {
-          await deviceStorage.deleteFile(extractLocalFileId(alvo.url));
-        } catch {
-          // ignore
-        }
+      if (patch.url && patch.url !== alvo.url) {
+        await safeDeleteLocalFile(alvo.url);
       }
       const documentos = db.documentos.map((d) => (d.id === id ? { ...d, ...patch } : d));
       await persist({ ...db, documentos });
@@ -598,13 +705,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const { db } = get();
       const alvo = db.documentos.find((d) => d.id === id);
       if (!alvo) return;
-      if (isLocalFileUrl(alvo.url)) {
-        try {
-          await deviceStorage.deleteFile(extractLocalFileId(alvo.url));
-        } catch {
-          // ignore
-        }
-      }
+      await safeDeleteLocalFile(alvo.url);
       const documentos = db.documentos.filter((d) => d.id !== id);
       await persist({ ...db, documentos });
       get().pushToast('info', `Documento "${alvo.nome}" excluído.`);
@@ -614,8 +715,8 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const { db } = get();
       const nova: EtapaCronograma = {
         ...etapa,
-        id: `etp-${Date.now()}`,
-        executado: Math.max(0, Math.min(100, etapa.executado)),
+        id: makeId('etp'),
+        executado: clampPercent(etapa.executado),
       };
       await persist({ ...db, etapasCronograma: [...db.etapasCronograma, nova] });
       get().pushToast('success', `Etapa "${nova.descricao}" adicionada ao cronograma.`);
@@ -624,7 +725,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
     updateEtapaCronograma: async (id, executado) => {
       const { db } = get();
       const etapasCronograma = db.etapasCronograma.map((e) =>
-        e.id === id ? { ...e, executado: Math.max(0, Math.min(100, executado)) } : e
+        e.id === id ? { ...e, executado: clampPercent(executado) } : e
       );
       await persist({ ...db, etapasCronograma });
     },
@@ -637,9 +738,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
               ...e,
               ...patch,
               executado:
-                patch.executado !== undefined
-                  ? Math.max(0, Math.min(100, patch.executado))
-                  : e.executado,
+                patch.executado !== undefined ? clampPercent(patch.executado) : e.executado,
             }
           : e
       );
@@ -656,10 +755,14 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
 
     addItemContrato: async (input) => {
       const { db } = get();
+      const qtd = sanitizeNonNegativeNumber(input.quantidade);
+      const preco = sanitizeNonNegativeNumber(input.precoUnitario);
       const novo: ItemContrato = {
         ...input,
-        id: `ic-${Date.now()}`,
-        valorTotal: Number((input.quantidade * input.precoUnitario).toFixed(2)),
+        id: makeId('ic'),
+        quantidade: qtd,
+        precoUnitario: preco,
+        valorTotal: Number((qtd * preco).toFixed(2)),
       };
       await persist({ ...db, itensContrato: [...db.itensContrato, novo] });
       get().pushToast('success', `Item ${novo.codigo} adicionado à planilha.`);
@@ -669,8 +772,14 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const { db } = get();
       const alvo = db.itensContrato.find((i) => i.id === id);
       if (!alvo) return;
-      const qtd = patch.quantidade !== undefined ? Math.max(0, Number(patch.quantidade.toFixed(2))) : alvo.quantidade;
-      const preco = patch.precoUnitario !== undefined ? Math.max(0, Number(patch.precoUnitario.toFixed(2))) : alvo.precoUnitario;
+      const qtd =
+        patch.quantidade !== undefined
+          ? sanitizeNonNegativeNumber(patch.quantidade, alvo.quantidade)
+          : alvo.quantidade;
+      const preco =
+        patch.precoUnitario !== undefined
+          ? sanitizeNonNegativeNumber(patch.precoUnitario, alvo.precoUnitario)
+          : alvo.precoUnitario;
       const atualizado: ItemContrato = {
         ...alvo,
         ...patch,
@@ -681,13 +790,17 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const itensContrato = db.itensContrato.map((i) => (i.id === id ? atualizado : i));
       const ctr = db.contratos.find((c) => c.id === alvo.contratoId);
 
-      // Sync draft measurements referencing this item so real calculations stay accurate
       const medicoes = db.medicoes.map((m) => {
         if (m.contratoId !== alvo.contratoId || m.status !== 'RASCUNHO') return m;
         const temItem = m.itensMedidos.some((im) => im.itemContratoId === id);
         if (!temItem) return m;
         const jaMedidoOutros = db.medicoes
-          .filter((other) => other.contratoId === alvo.contratoId && other.id !== m.id && other.status !== 'REJEITADA')
+          .filter(
+            (other) =>
+              other.contratoId === alvo.contratoId &&
+              other.id !== m.id &&
+              other.status !== 'REJEITADA'
+          )
           .flatMap((other) => other.itensMedidos)
           .filter((im) => im.itemContratoId === id)
           .reduce((acc, im) => acc + im.quantidadeMedida, 0);
@@ -726,7 +839,22 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const alvo = db.itensContrato.find((i) => i.id === id);
       if (!alvo) return;
       const itensContrato = db.itensContrato.filter((i) => i.id !== id);
-      await persist({ ...db, itensContrato });
+      const ctr = db.contratos.find((c) => c.id === alvo.contratoId);
+
+      const medicoes = db.medicoes.map((m) => {
+        if (m.contratoId !== alvo.contratoId || m.status !== 'RASCUNHO') return m;
+        const itensMedidos = m.itensMedidos.filter((im) => im.itemContratoId !== id);
+        if (itensMedidos.length === m.itensMedidos.length) return m;
+        const valor = Number(itensMedidos.reduce((acc, i) => acc + i.valorMedido, 0).toFixed(2));
+        return {
+          ...m,
+          itensMedidos,
+          valor,
+          percentual: ctr ? percentualExecutado(ctr.valorAtual, valor) : m.percentual,
+        };
+      });
+
+      await persist({ ...db, itensContrato, medicoes });
       get().pushToast('info', `Item ${alvo.codigo} removido do banco da planilha.`);
     },
 
@@ -746,17 +874,19 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       let itensDoContrato =
         modo === 'SUBSTITUIR' ? [] : db.itensContrato.filter((i) => i.contratoId === contratoId);
 
-      const nomeArquivoFinal = arquivo?.name ?? fonteNome ?? contrato.planilhaOrigem?.nomeArquivo ?? 'Planilha Importada';
-      const formatoFinal: 'XLSX' | 'PDF' = nomeArquivoFinal.toLowerCase().endsWith('.pdf') ? 'PDF' : 'XLSX';
+      const nomeArquivoFinal =
+        arquivo?.name ?? fonteNome ?? contrato.planilhaOrigem?.nomeArquivo ?? 'Planilha Importada';
+      const formatoFinal: 'XLSX' | 'PDF' = nomeArquivoFinal.toLowerCase().endsWith('.pdf')
+        ? 'PDF'
+        : 'XLSX';
 
-      const now = Date.now();
       itens.forEach((row, idx) => {
         const codigoNorm = row.codigo.trim().toLowerCase();
         const existenteIdx = itensDoContrato.findIndex(
           (ic) => ic.codigo.trim().toLowerCase() === codigoNorm
         );
-        const qtd = Math.max(0, Number(row.quantidadeContratada.toFixed(2)));
-        const preco = Math.max(0, Number(row.precoUnitario.toFixed(2)));
+        const qtd = sanitizeNonNegativeNumber(row.quantidadeContratada);
+        const preco = sanitizeNonNegativeNumber(row.precoUnitario);
         const valorTotal = Number((qtd * preco).toFixed(2));
 
         if (existenteIdx >= 0) {
@@ -775,7 +905,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           );
         } else {
           itensDoContrato.push({
-            id: `ic-${now}-${idx}`,
+            id: makeId(`ic-${idx}`),
             contratoId,
             codigo: row.codigo.trim(),
             descricao: row.descricao.trim(),
@@ -817,16 +947,19 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           : c
       );
 
-      // Keep draft measurements synced with imported spreadsheet database
       const medicoes = db.medicoes.map((m) => {
         if (m.contratoId !== contratoId || m.status !== 'RASCUNHO') return m;
         const itensMedidosAtualizados = m.itensMedidos.map((im) => {
           const ic = itensDoContrato.find(
-            (i) => i.id === im.itemContratoId || i.codigo.trim().toLowerCase() === im.codigo.trim().toLowerCase()
+            (i) =>
+              i.id === im.itemContratoId ||
+              i.codigo.trim().toLowerCase() === im.codigo.trim().toLowerCase()
           );
           if (!ic) return im;
           const jaMedidoOutros = db.medicoes
-            .filter((o) => o.contratoId === contratoId && o.id !== m.id && o.status !== 'REJEITADA')
+            .filter(
+              (o) => o.contratoId === contratoId && o.id !== m.id && o.status !== 'REJEITADA'
+            )
             .flatMap((o) => o.itensMedidos)
             .filter((oim) => oim.itemContratoId === ic.id)
             .reduce((acc, oim) => acc + oim.quantidadeMedida, 0);
@@ -862,7 +995,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
         try {
           const saved = await deviceStorage.saveFileToDevice(arquivo);
           const novoDoc: Documento = {
-            id: `doc-${now}-planilha`,
+            id: makeId('doc-planilha'),
             contratoId,
             nome: arquivo.name,
             tipo: 'ORCAMENTO',
@@ -872,7 +1005,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           };
           documentos = [novoDoc, ...documentos];
         } catch {
-          // Non-fatal if saving original file fails
+          // Falha ao salvar arquivo anexo não bloqueia importação da planilha
         }
       }
 
@@ -919,7 +1052,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           .reduce((acc, im) => acc + im.quantidadeMedida, 0);
         const saldoAnterior = Math.max(0, Number((ic.quantidade - jaMedido).toFixed(2)));
         return {
-          id: `im-${Date.now()}-${ic.id}`,
+          id: makeId(`im-${ic.id}`),
           itemContratoId: ic.id,
           codigo: ic.codigo,
           descricao: ic.descricao,
@@ -934,7 +1067,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       });
 
       const nova: Medicao = {
-        id: `med-${Date.now()}`,
+        id: makeId('med'),
         contratoId,
         numero,
         competencia,
@@ -977,17 +1110,16 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
         urls.add(med.notaFiscal.arquivoUrl);
       }
       for (const p of db.processosGefispag) {
-        if (p.medicaoId === id && p.notaFiscalInfo?.arquivoUrl && isLocalFileUrl(p.notaFiscalInfo.arquivoUrl)) {
+        if (
+          p.medicaoId === id &&
+          p.notaFiscalInfo?.arquivoUrl &&
+          isLocalFileUrl(p.notaFiscalInfo.arquivoUrl)
+        ) {
           urls.add(p.notaFiscalInfo.arquivoUrl);
         }
       }
-      for (const url of urls) {
-        try {
-          await deviceStorage.deleteFile(extractLocalFileId(url));
-        } catch {
-          // ignore
-        }
-      }
+      await Promise.all([...urls].map((url) => safeDeleteLocalFile(url)));
+
       const audit = makeAudit(
         db.configuracoes.fiscalPadrao,
         'EXCLUSAO_MEDICAO',
@@ -1033,20 +1165,17 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       if (payload.itemContratoId) {
         targetItemContrato = db.itensContrato.find((i) => i.id === payload.itemContratoId);
       } else if (payload.codigo && payload.descricao) {
+        const qtdCtr = sanitizeNonNegativeNumber(payload.quantidadeContratada, 1);
+        const precoUnit = sanitizeNonNegativeNumber(payload.precoUnitario, 0);
         const novoItemCtr: ItemContrato = {
-          id: `ic-${Date.now()}`,
+          id: makeId('ic'),
           contratoId: ctr.id,
           codigo: payload.codigo.trim(),
           descricao: payload.descricao.trim(),
           unidade: payload.unidade?.trim() || 'un',
-          quantidade: Number(payload.quantidadeContratada) || 1,
-          precoUnitario: Number(payload.precoUnitario) || 0,
-          valorTotal: Number(
-            (
-              (Number(payload.quantidadeContratada) || 1) *
-              (Number(payload.precoUnitario) || 0)
-            ).toFixed(2)
-          ),
+          quantidade: qtdCtr,
+          precoUnitario: precoUnit,
+          valorTotal: Number((qtdCtr * precoUnit).toFixed(2)),
         };
         nextItensContrato = [...db.itensContrato, novoItemCtr];
         targetItemContrato = novoItemCtr;
@@ -1064,14 +1193,14 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
         0,
         Number((targetItemContrato.quantidade - jaMedidoOutros).toFixed(2))
       );
-      if (payload.quantidadeMedida > saldoAnterior) {
+      const qtdMedida = sanitizeNonNegativeNumber(payload.quantidadeMedida);
+      if (qtdMedida > saldoAnterior) {
         get().pushToast(
           'error',
-          `Quantidade (${payload.quantidadeMedida}) excede o saldo disponível (${saldoAnterior} ${targetItemContrato.unidade}).`
+          `Quantidade (${qtdMedida}) excede o saldo disponível (${saldoAnterior} ${targetItemContrato.unidade}).`
         );
         return;
       }
-      const qtdMedida = Math.max(0, Number(payload.quantidadeMedida.toFixed(2)));
 
       const existingIdx = med.itensMedidos.findIndex(
         (i) => i.itemContratoId === targetItemContrato!.id
@@ -1091,7 +1220,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
         );
       } else {
         const novoItemMedido: ItemMedido = {
-          id: `im-${Date.now()}-${targetItemContrato.id}`,
+          id: makeId(`im-${targetItemContrato.id}`),
           itemContratoId: targetItemContrato.id,
           codigo: targetItemContrato.codigo,
           descricao: targetItemContrato.descricao,
@@ -1149,7 +1278,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           .reduce((acc, im) => acc + im.quantidadeMedida, 0);
         const saldoAnterior = Math.max(0, Number((ic.quantidade - jaMedido).toFixed(2)));
         return {
-          id: `im-${Date.now()}-${ic.id}`,
+          id: makeId(`im-${ic.id}`),
           itemContratoId: ic.id,
           codigo: ic.codigo,
           descricao: ic.descricao,
@@ -1185,7 +1314,6 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const ctr = db.contratos.find((c) => c.id === med.contratoId);
       if (!ctr || itens.length === 0) return;
 
-      const now = Date.now();
       const outrosItensContrato = db.itensContrato.filter((i) => i.contratoId !== ctr.id);
       let itensDoContrato = db.itensContrato.filter((i) => i.contratoId === ctr.id);
 
@@ -1196,31 +1324,28 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       itens.forEach((row, idx) => {
         const codigoTrim = row.codigo.trim();
         const codigoNorm = codigoTrim.toLowerCase();
-        const qtdContratada = Math.max(0, Number(row.quantidadeContratada.toFixed(2)));
-        const precoUnit = Math.max(0, Number(row.precoUnitario.toFixed(2)));
+        const qtdContratada = sanitizeNonNegativeNumber(row.quantidadeContratada);
+        const precoUnit = sanitizeNonNegativeNumber(row.precoUnitario);
         const valorTotalItem = Number((qtdContratada * precoUnit).toFixed(2));
 
         let ic = itensDoContrato.find((i) => i.codigo.trim().toLowerCase() === codigoNorm);
         if (ic) {
+          const nextQtd = qtdContratada > 0 ? qtdContratada : ic.quantidade;
+          const nextPreco = precoUnit > 0 ? precoUnit : ic.precoUnitario;
           ic = {
             ...ic,
             descricao: row.descricao.trim(),
             unidade: row.unidade.trim() || ic.unidade,
-            quantidade: qtdContratada > 0 ? qtdContratada : ic.quantidade,
-            precoUnitario: precoUnit > 0 ? precoUnit : ic.precoUnitario,
-            valorTotal: Number(
-              (
-                (qtdContratada > 0 ? qtdContratada : ic.quantidade) *
-                (precoUnit > 0 ? precoUnit : ic.precoUnitario)
-              ).toFixed(2)
-            ),
+            quantidade: nextQtd,
+            precoUnitario: nextPreco,
+            valorTotal: Number((nextQtd * nextPreco).toFixed(2)),
           };
           itensDoContrato = itensDoContrato.map((existing) =>
             existing.id === ic!.id ? ic! : existing
           );
         } else {
           ic = {
-            id: `ic-${now}-${idx}`,
+            id: makeId(`ic-${idx}`),
             contratoId: ctr.id,
             codigo: codigoTrim,
             descricao: row.descricao.trim(),
@@ -1239,7 +1364,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           .reduce((acc, im) => acc + im.quantidadeMedida, 0);
 
         const saldoAnterior = Math.max(0, Number((ic.quantidade - jaMedidoOutros).toFixed(2)));
-        let qtdMedida = Math.max(0, Number((row.quantidadeMedida ?? 0).toFixed(2)));
+        let qtdMedida = sanitizeNonNegativeNumber(row.quantidadeMedida ?? 0);
         if (qtdMedida > saldoAnterior) {
           qtdMedida = saldoAnterior;
           ajustesSaldo += 1;
@@ -1252,7 +1377,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
         );
 
         const novoItemMedido: ItemMedido = {
-          id: existingMedIdx >= 0 ? novosItensMedidos[existingMedIdx].id : `im-${now}-${idx}`,
+          id: existingMedIdx >= 0 ? novosItensMedidos[existingMedIdx].id : makeId(`im-${idx}`),
           itemContratoId: ic.id,
           codigo: ic.codigo,
           descricao: ic.descricao,
@@ -1311,7 +1436,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       );
       const perc = percentualExecutado(contratoValorAtual, valorTotalMedicao);
 
-      const medicoes = db.medicoes.map((m) =>
+      let medicoes = db.medicoes.map((m) =>
         m.id === med.id
           ? {
               ...m,
@@ -1322,12 +1447,20 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           : m
       );
 
+      if (contratoValorAtual !== ctr.valorAtual) {
+        medicoes = medicoes.map((m) =>
+          m.contratoId === ctr.id && m.id !== med.id
+            ? { ...m, percentual: percentualExecutado(contratoValorAtual, m.valor) }
+            : m
+        );
+      }
+
       let documentos = db.documentos;
       if (arquivo) {
         try {
           const saved = await deviceStorage.saveFileToDevice(arquivo);
           const novoDoc: Documento = {
-            id: `doc-${now}-med`,
+            id: makeId('doc-med'),
             contratoId: ctr.id,
             nome: arquivo.name,
             tipo: 'MEDICAO',
@@ -1337,7 +1470,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           };
           documentos = [novoDoc, ...documentos];
         } catch {
-          // Non-fatal
+          // Falha não bloqueia a importação
         }
       }
 
@@ -1370,7 +1503,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
 
     addDiario: async (input) => {
       const { db } = get();
-      const novo: DiarioObra = { ...input, id: `rdo-${Date.now()}` };
+      const novo: DiarioObra = { ...input, id: makeId('rdo') };
       const audit = makeAudit(
         db.configuracoes.fiscalPadrao,
         'CRIACAO_RDO',
@@ -1403,15 +1536,8 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const { db } = get();
       const diario = db.diarios.find((d) => d.id === id);
       if (!diario) return;
-      for (const f of diario.fotos) {
-        if (isLocalFileUrl(f.url)) {
-          try {
-            await deviceStorage.deleteFile(extractLocalFileId(f.url));
-          } catch {
-            // ignore
-          }
-        }
-      }
+      await Promise.all(diario.fotos.map((f) => safeDeleteLocalFile(f.url)));
+
       const audit = makeAudit(
         db.configuracoes.fiscalPadrao,
         'EXCLUSAO_RDO',
@@ -1438,15 +1564,18 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
 
       if (ocorrenciaInput.criticidade === 'ALTA' || ocorrenciaInput.criticidade === 'CRITICA') {
         const seq = db.naoConformidades.length + 1;
-        const gravidade: GravidadeNC = ocorrenciaInput.criticidade === 'CRITICA' ? 'CRITICA' : 'ALTA';
-        const dias = calcularPrazo(gravidade);
+        const gravidade: GravidadeNC =
+          ocorrenciaInput.criticidade === 'CRITICA' ? 'CRITICA' : 'ALTA';
+        const dias = db.configuracoes.prazosNC[gravidade] ?? calcularPrazo(gravidade);
+        const hoje = dayjs().format('YYYY-MM-DD');
+        const ncId = makeId('nc');
         const novaNc: NaoConformidade = {
-          id: `nc-${Date.now()}`,
+          id: ncId,
           contratoId: diario.contratoId,
           codigo: gerarCodigoNC(seq),
           titulo: ocorrenciaInput.descricao.slice(0, 72),
           descricao: ocorrenciaInput.descricao,
-          dataRegistro: dayjs().format('YYYY-MM-DD'),
+          dataRegistro: hoje,
           dataLimite: dayjs().add(dias, 'day').format('YYYY-MM-DD'),
           origem: 'RDO',
           status: 'ABERTA',
@@ -1455,16 +1584,15 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           evidencias: [],
           historico: [
             {
-              id: `hnc-${Date.now()}`,
-              ncId: '',
-              data: dayjs().format('YYYY-MM-DD'),
+              id: makeId('hnc'),
+              ncId,
+              data: hoje,
               usuario: db.configuracoes.fiscalPadrao,
               descricao: `NC gerada automaticamente por ocorrência ${ocorrenciaInput.criticidade} no RDO de ${dayjs(diario.data).format('DD/MM/YYYY')}.`,
             },
           ],
         };
-        novaNc.historico[0].ncId = novaNc.id;
-        ncGeradaId = novaNc.id;
+        ncGeradaId = ncId;
         naoConformidades = [novaNc, ...naoConformidades];
         auditoria = [
           makeAudit(
@@ -1476,12 +1604,15 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           ),
           ...auditoria,
         ];
-        get().pushToast('info', `${novaNc.codigo} criada automaticamente pela criticidade da ocorrência.`);
+        get().pushToast(
+          'info',
+          `${novaNc.codigo} criada automaticamente pela criticidade da ocorrência.`
+        );
       }
 
       const novaOcorrencia: Ocorrencia = {
         ...ocorrenciaInput,
-        id: `oc-${Date.now()}`,
+        id: makeId('oc'),
         ncGeradaId,
       };
       const diarios = db.diarios.map((d) =>
@@ -1495,8 +1626,9 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const seq = db.naoConformidades.length + 1;
       const dias = db.configuracoes.prazosNC[payload.gravidade] ?? calcularPrazo(payload.gravidade);
       const hoje = dayjs().format('YYYY-MM-DD');
+      const ncId = makeId('nc');
       const nova: NaoConformidade = {
-        id: `nc-${Date.now()}`,
+        id: ncId,
         contratoId: payload.contratoId,
         codigo: gerarCodigoNC(seq),
         titulo: payload.titulo,
@@ -1510,15 +1642,14 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
         evidencias: [],
         historico: [
           {
-            id: `hnc-${Date.now()}`,
-            ncId: '',
+            id: makeId('hnc'),
+            ncId,
             data: hoje,
             usuario: db.configuracoes.fiscalPadrao,
             descricao: `Não conformidade registrada (${payload.origem} · Gravidade ${payload.gravidade}).`,
           },
         ],
       };
-      nova.historico[0].ncId = nova.id;
       const audit = makeAudit(
         db.configuracoes.fiscalPadrao,
         'ABERTURA_NC',
@@ -1548,7 +1679,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
               historico: [
                 ...nc.historico,
                 {
-                  id: `hnc-${Date.now()}`,
+                  id: makeId('hnc'),
                   ncId: id,
                   data: hoje,
                   usuario: db.configuracoes.fiscalPadrao,
@@ -1566,15 +1697,8 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const { db } = get();
       const alvo = db.naoConformidades.find((n) => n.id === id);
       if (!alvo) return;
-      for (const ev of alvo.evidencias) {
-        if (isLocalFileUrl(ev.url)) {
-          try {
-            await deviceStorage.deleteFile(extractLocalFileId(ev.url));
-          } catch {
-            // ignore
-          }
-        }
-      }
+      await Promise.all(alvo.evidencias.map((ev) => safeDeleteLocalFile(ev.url)));
+
       const diarios = db.diarios.map((d) => ({
         ...d,
         ocorrencias: d.ocorrencias.map((oc) =>
@@ -1609,7 +1733,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           historico: [
             ...nc.historico,
             {
-              id: `hnc-${Date.now()}`,
+              id: makeId('hnc'),
               ncId: id,
               data: hoje,
               usuario: db.configuracoes.fiscalPadrao,
@@ -1633,7 +1757,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
               historico: [
                 ...nc.historico,
                 {
-                  id: `hnc-${Date.now()}`,
+                  id: makeId('hnc'),
                   ncId: id,
                   data: dayjs().format('YYYY-MM-DD'),
                   usuario: db.configuracoes.fiscalPadrao,
@@ -1653,10 +1777,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
         nc.id === id
           ? {
               ...nc,
-              evidencias: [
-                ...nc.evidencias,
-                { ...evInput, id: `ev-${Date.now()}`, ncId: id },
-              ],
+              evidencias: [...nc.evidencias, { ...evInput, id: makeId('ev'), ncId: id }],
             }
           : nc
       );
@@ -1668,12 +1789,8 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const { db } = get();
       const nc = db.naoConformidades.find((n) => n.id === ncId);
       const oldEv = nc?.evidencias.find((e) => e.id === evidenciaId);
-      if (oldEv && patch.url && patch.url !== oldEv.url && isLocalFileUrl(oldEv.url)) {
-        try {
-          await deviceStorage.deleteFile(extractLocalFileId(oldEv.url));
-        } catch {
-          // ignore
-        }
+      if (oldEv && patch.url && patch.url !== oldEv.url) {
+        await safeDeleteLocalFile(oldEv.url);
       }
       const naoConformidades = db.naoConformidades.map((item) =>
         item.id === ncId
@@ -1693,12 +1810,8 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const { db } = get();
       const nc = db.naoConformidades.find((n) => n.id === ncId);
       const oldEv = nc?.evidencias.find((e) => e.id === evidenciaId);
-      if (oldEv && isLocalFileUrl(oldEv.url)) {
-        try {
-          await deviceStorage.deleteFile(extractLocalFileId(oldEv.url));
-        } catch {
-          // ignore
-        }
+      if (oldEv) {
+        await safeDeleteLocalFile(oldEv.url);
       }
       const naoConformidades = db.naoConformidades.map((item) =>
         item.id === ncId
@@ -1724,7 +1837,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           valor: med.valor,
         };
       const proc: ProcessoPagamentoGEFISPAG = {
-        id: `gef-${Date.now()}`,
+        id: makeId('gef'),
         numeroProcesso: `GEFISPAG-${dayjs().year()}/${(db.processosGefispag.length + 893)
           .toString()
           .padStart(4, '0')}`,
@@ -1738,16 +1851,46 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
         valorLiquido: ret.valorLiquido,
         statusWorkflow: 'AUTUACAO',
         checklistDocumental: [
-          { id: 'cd-1', label: 'Nota Fiscal Eletrônica de Serviços atestada', obrigatorio: true, conferido: true },
-          { id: 'cd-2', label: `Boletim de Medição nº ${med.numero} assinado`, obrigatorio: true, conferido: true },
-          { id: 'cd-3', label: 'Memória de Cálculo analítica anexa', obrigatorio: true, conferido: med.memoriasCalculo.length > 0 },
-          { id: 'cd-4', label: 'Relatório Fotográfico Georreferenciado', obrigatorio: true, conferido: med.fotos.length > 0 },
-          { id: 'cd-5', label: 'Relatórios Diários de Obra (RDO) do período', obrigatorio: true, conferido: true },
-          { id: 'cd-6', label: 'Guia GFIP/SEFIP e Folha de Pagamento da Obra', obrigatorio: true, conferido: false },
+          {
+            id: 'cd-1',
+            label: 'Nota Fiscal Eletrônica de Serviços atestada',
+            obrigatorio: true,
+            conferido: true,
+          },
+          {
+            id: 'cd-2',
+            label: `Boletim de Medição nº ${med.numero} assinado`,
+            obrigatorio: true,
+            conferido: true,
+          },
+          {
+            id: 'cd-3',
+            label: 'Memória de Cálculo analítica anexa',
+            obrigatorio: true,
+            conferido: med.memoriasCalculo.length > 0,
+          },
+          {
+            id: 'cd-4',
+            label: 'Relatório Fotográfico Georreferenciado',
+            obrigatorio: true,
+            conferido: med.fotos.length > 0,
+          },
+          {
+            id: 'cd-5',
+            label: 'Relatórios Diários de Obra (RDO) do período',
+            obrigatorio: true,
+            conferido: true,
+          },
+          {
+            id: 'cd-6',
+            label: 'Guia GFIP/SEFIP e Folha de Pagamento da Obra',
+            obrigatorio: true,
+            conferido: false,
+          },
         ],
         certidoes: [
           {
-            id: `c1-${Date.now()}`,
+            id: makeId('c1'),
             nome: 'CND Federal / PGFN',
             orgao: 'Receita Federal do Brasil',
             codigoAutenticacao: 'RFB-2026-8812',
@@ -1755,7 +1898,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
             regular: true,
           },
           {
-            id: `c2-${Date.now()}`,
+            id: makeId('c2'),
             nome: 'CRF — Regularidade do FGTS',
             orgao: 'Caixa Econômica Federal',
             codigoAutenticacao: 'CEF-2026-4410',
@@ -1763,7 +1906,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
             regular: true,
           },
           {
-            id: `c3-${Date.now()}`,
+            id: makeId('c3'),
             nome: 'CNDT — Débitos Trabalhistas',
             orgao: 'TST',
             codigoAutenticacao: 'TST-2026-7719',
@@ -1806,7 +1949,13 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       );
       const auditoria = auditMsg
         ? [
-            makeAudit(db.configuracoes.gestorPadrao, 'ATUALIZACAO_GEFISPAG', 'GEFISPAG', id, auditMsg),
+            makeAudit(
+              db.configuracoes.gestorPadrao,
+              'ATUALIZACAO_GEFISPAG',
+              'GEFISPAG',
+              id,
+              auditMsg
+            ),
             ...db.auditoria,
           ]
         : db.auditoria;
@@ -1817,13 +1966,8 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const { db } = get();
       const proc = db.processosGefispag.find((p) => p.id === id);
       if (!proc) return;
-      if (proc.notaFiscalInfo?.arquivoUrl && isLocalFileUrl(proc.notaFiscalInfo.arquivoUrl)) {
-        try {
-          await deviceStorage.deleteFile(extractLocalFileId(proc.notaFiscalInfo.arquivoUrl));
-        } catch {
-          // ignore
-        }
-      }
+      await safeDeleteLocalFile(proc.notaFiscalInfo?.arquivoUrl);
+
       const medicoes = db.medicoes.map((m) =>
         m.id === proc.medicaoId && m.status !== 'REJEITADA'
           ? { ...m, status: 'APROVADA' as const }
@@ -1877,7 +2021,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
 
     addRecebimento: async (input) => {
       const { db } = get();
-      const novo: TermoRecebimento = { ...input, id: `rec-${Date.now()}` };
+      const novo: TermoRecebimento = { ...input, id: makeId('rec') };
       const contratos =
         novo.tipo === 'DEFINITIVO' && novo.status === 'ASSINADO'
           ? db.contratos.map((c) =>
@@ -1953,13 +2097,19 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const med = db.medicoes.find((m) => m.id === medicaoId);
       if (!med) return;
 
+      if (
+        med.notaFiscal?.arquivoUrl &&
+        nf.arquivoUrl &&
+        med.notaFiscal.arquivoUrl !== nf.arquivoUrl
+      ) {
+        await safeDeleteLocalFile(med.notaFiscal.arquivoUrl);
+      }
+
       const medicoes = db.medicoes.map((m) =>
         m.id === medicaoId ? { ...m, notaFiscal: nf } : m
       );
       const processosGefispag = db.processosGefispag.map((p) =>
-        p.medicaoId === medicaoId
-          ? { ...p, notaFiscal: nf.numero, notaFiscalInfo: nf }
-          : p
+        p.medicaoId === medicaoId ? { ...p, notaFiscal: nf.numero, notaFiscalInfo: nf } : p
       );
 
       let documentos = db.documentos;
@@ -1969,7 +2119,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
           (d) => d.contratoId === med.contratoId && d.tipo === 'NOTA_FISCAL' && d.nome === docNome
         );
         const novoDoc: Documento = {
-          id: existingIdx >= 0 ? documentos[existingIdx].id : `doc-nf-${Date.now()}`,
+          id: existingIdx >= 0 ? documentos[existingIdx].id : makeId('doc-nf'),
           contratoId: med.contratoId,
           nome: docNome,
           tipo: 'NOTA_FISCAL',
@@ -2004,13 +2154,8 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const { db } = get();
       const med = db.medicoes.find((m) => m.id === medicaoId);
       if (!med) return;
-      if (med.notaFiscal?.arquivoUrl && isLocalFileUrl(med.notaFiscal.arquivoUrl)) {
-        try {
-          await deviceStorage.deleteFile(extractLocalFileId(med.notaFiscal.arquivoUrl));
-        } catch {
-          // ignore
-        }
-      }
+      await safeDeleteLocalFile(med.notaFiscal?.arquivoUrl);
+
       const medicoes = db.medicoes.map((m) =>
         m.id === medicaoId ? { ...m, notaFiscal: undefined } : m
       );
@@ -2028,6 +2173,14 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const proc = db.processosGefispag.find((p) => p.id === processoId);
       if (!proc) return;
 
+      if (
+        proc.notaFiscalInfo?.arquivoUrl &&
+        nf.arquivoUrl &&
+        proc.notaFiscalInfo.arquivoUrl !== nf.arquivoUrl
+      ) {
+        await safeDeleteLocalFile(proc.notaFiscalInfo.arquivoUrl);
+      }
+
       const processosGefispag = db.processosGefispag.map((p) =>
         p.id === processoId ? { ...p, notaFiscal: nf.numero, notaFiscalInfo: nf } : p
       );
@@ -2039,10 +2192,11 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       if (nf.arquivoUrl) {
         const docNome = `${nf.numero} — ${proc.numeroProcesso}`;
         const existingIdx = documentos.findIndex(
-          (d) => d.contratoId === proc.contratoId && d.tipo === 'NOTA_FISCAL' && d.nome === docNome
+          (d) =>
+            d.contratoId === proc.contratoId && d.tipo === 'NOTA_FISCAL' && d.nome === docNome
         );
         const novoDoc: Documento = {
-          id: existingIdx >= 0 ? documentos[existingIdx].id : `doc-nf-${Date.now()}`,
+          id: existingIdx >= 0 ? documentos[existingIdx].id : makeId('doc-nf'),
           contratoId: proc.contratoId,
           nome: docNome,
           tipo: 'NOTA_FISCAL',
@@ -2077,13 +2231,8 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
       const { db } = get();
       const proc = db.processosGefispag.find((p) => p.id === processoId);
       if (!proc) return;
-      if (proc.notaFiscalInfo?.arquivoUrl && isLocalFileUrl(proc.notaFiscalInfo.arquivoUrl)) {
-        try {
-          await deviceStorage.deleteFile(extractLocalFileId(proc.notaFiscalInfo.arquivoUrl));
-        } catch {
-          // ignore
-        }
-      }
+      await safeDeleteLocalFile(proc.notaFiscalInfo?.arquivoUrl);
+
       const processosGefispag = db.processosGefispag.map((p) =>
         p.id === processoId
           ? { ...p, notaFiscal: 'NF-e Pendente', notaFiscalInfo: undefined }
@@ -2098,7 +2247,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
 
     addAssinaturaEntidade: async (tipo, id, assinatura) => {
       const { db } = get();
-      let nextDb = { ...db };
+      const nextDb: FiscalDatabase = { ...db };
 
       if (tipo === 'MEDICAO') {
         nextDb.medicoes = db.medicoes.map((m) =>
@@ -2138,7 +2287,7 @@ export const useFiscalStore = create<FiscalState>((set, get) => {
 
     removeAssinaturaEntidade: async (tipo, id, assinaturaId) => {
       const { db } = get();
-      let nextDb = { ...db };
+      const nextDb: FiscalDatabase = { ...db };
 
       if (tipo === 'MEDICAO') {
         nextDb.medicoes = db.medicoes.map((m) =>
