@@ -372,7 +372,7 @@ export interface PlanoAcao {
 }
 
 export type TipoEvidencia = 'FOTO' | 'VIDEO' | 'PDF' | 'ATA' | 'OFICIO' | 'MEMORIAL' | 'OUTROS';
-tipoPersonalizado?: string;
+
 export interface Evidencia {
   id: string;
   ncId: string;
@@ -380,6 +380,7 @@ export interface Evidencia {
   descricao: string;
   url: string;
   data: string;
+  tipoPersonalizado?: string;
 }
 
 export interface HistoricoNC {
