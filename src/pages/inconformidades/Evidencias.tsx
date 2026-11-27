@@ -10,13 +10,14 @@ import { formatDateBR } from '../../utils/engineering';
 export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
   const { addNcEvidencia, updateNcEvidencia, deleteNcEvidencia } = useFiscalStore();
   const [tipo, setTipo] = useState<TipoEvidencia>('FOTO');
-  const [tipoPersonalizado, setTipoPersinalizado] = useState('');
+  const [tipoPersonalizado, setTipoPersonalizado] = useState('');
   const [descricao, setDescricao] = useState('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [saving, setSaving] = useState(false);
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTipo, setEditTipo] = useState<TipoEvidencia>('FOTO');
+  const [editTipoPersonalizado, setEditTipoPersonalizado] = useState('');
   const [editDescricao, setEditDescricao] = useState('');
   const [editData, setEditData] = useState('');
   const [editFile, setEditFile] = useState<File | null>(null);
@@ -32,6 +33,8 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
   const handleAdd = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!descricao.trim()) return;
+    if (tipo === 'OUTROS' && !tipoPersonalizado.trim()) return;
+
     setSaving(true);
     try {
       let url = '#evidencia';
@@ -41,11 +44,13 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
       }
       await addNcEvidencia(nc.id, {
         tipo,
+        tipoPersonalizado: tipo === 'OUTROS' ? tipoPersonalizado.trim().toUpperCase() : undefined,
         descricao: descricao.trim(),
         url,
         data: new Date().toISOString().slice(0, 10),
       });
       setDescricao('');
+      setTipoPersonalizado('');
       setSelectedFile(null);
     } finally {
       setSaving(false);
@@ -55,6 +60,7 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
   const startEdit = (ev: Evidencia) => {
     setEditingId(ev.id);
     setEditTipo(ev.tipo);
+    setEditTipoPersonalizado(ev.tipoPersonalizado ?? '');
     setEditDescricao(ev.descricao);
     setEditData(ev.data);
     setEditFile(null);
@@ -62,6 +68,8 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
 
   const handleSaveEdit = async (ev: Evidencia) => {
     if (!editDescricao.trim()) return;
+    if (editTipo === 'OUTROS' && !editTipoPersonalizado.trim()) return;
+
     setSavingEdit(true);
     try {
       let url = ev.url;
@@ -71,11 +79,14 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
       }
       await updateNcEvidencia(nc.id, ev.id, {
         tipo: editTipo,
+        tipoPersonalizado:
+          editTipo === 'OUTROS' ? editTipoPersonalizado.trim().toUpperCase() : undefined,
         descricao: editDescricao.trim(),
         data: editData,
         url,
       });
       setEditingId(null);
+      setEditTipoPersonalizado('');
       setEditFile(null);
     } finally {
       setSavingEdit(false);
@@ -96,7 +107,13 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
             <label className="block text-xs text-slate-500 mb-1">Tipo</label>
             <select
               value={tipo}
-              onChange={(e) => setTipo(e.target.value as TipoEvidencia)}
+              onChange={(e) => {
+                const novoTipo = e.target.value as TipoEvidencia;
+                setTipo(novoTipo);
+                if (novoTipo !== 'OUTROS') {
+                  setTipoPersonalizado('');
+                }
+              }}
               className="w-full px-3 py-2 text-sm bg-white border border-slate-300 rounded-md"
             >
               {(['FOTO', 'VIDEO', 'PDF', 'ATA', 'OFICIO', 'MEMORIAL', 'OUTROS'] as const).map((t) => (
@@ -106,7 +123,20 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
               ))}
             </select>
           </div>
-          <div className="sm:col-span-2">
+          {tipo === 'OUTROS' && (
+            <div>
+              <label className="block text-xs text-slate-500 mb-1">Especificar Tipo *</label>
+              <input
+                required
+                type="text"
+                value={tipoPersonalizado}
+                onChange={(e) => setTipoPersonalizado(e.target.value)}
+                placeholder="Ex: ART, Laudo, RDO"
+                className="w-full px-3 py-2 text-sm border border-slate-300 rounded-md"
+              />
+            </div>
+          )}
+          <div className={tipo === 'OUTROS' ? 'sm:col-span-1' : 'sm:col-span-2'}>
             <label className="block text-xs text-slate-500 mb-1">Descrição</label>
             <input
               required
@@ -146,6 +176,11 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
         ) : (
           nc.evidencias.map((ev) => {
             const isEditing = editingId === ev.id;
+            const rotuloTipo =
+              ev.tipo === 'OUTROS' && ev.tipoPersonalizado
+                ? `OUTROS (${ev.tipoPersonalizado})`
+                : ev.tipo;
+
             return (
               <div key={ev.id} className="bg-white border border-slate-200 rounded-lg overflow-hidden">
                 {ev.tipo === 'FOTO' && ev.url && !ev.url.startsWith('#') && (
@@ -162,7 +197,13 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
                         <label className="block text-xs text-slate-500 mb-1">Tipo</label>
                         <select
                           value={editTipo}
-                          onChange={(e) => setEditTipo(e.target.value as TipoEvidencia)}
+                          onChange={(e) => {
+                            const novoTipo = e.target.value as TipoEvidencia;
+                            setEditTipo(novoTipo);
+                            if (novoTipo !== 'OUTROS') {
+                              setEditTipoPersonalizado('');
+                            }
+                          }}
                           className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md"
                         >
                           {(['FOTO', 'VIDEO', 'PDF', 'ATA', 'OFICIO', 'MEMORIAL', 'OUTROS'] as const).map(
@@ -184,6 +225,21 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
                         />
                       </div>
                     </div>
+                    {editTipo === 'OUTROS' && (
+                      <div>
+                        <label className="block text-xs text-slate-500 mb-1">
+                          Especificar Tipo *
+                        </label>
+                        <input
+                          required
+                          type="text"
+                          value={editTipoPersonalizado}
+                          onChange={(e) => setEditTipoPersonalizado(e.target.value)}
+                          placeholder="Ex: ART, Laudo, RDO"
+                          className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-md bg-white"
+                        />
+                      </div>
+                    )}
                     <div>
                       <label className="block text-xs text-slate-500 mb-1">Descrição *</label>
                       <input
@@ -208,6 +264,7 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
                         type="button"
                         onClick={() => {
                           setEditingId(null);
+                          setEditTipoPersonalizado('');
                           setEditFile(null);
                         }}
                         className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded hover:bg-slate-100"
@@ -232,7 +289,7 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
                       <FileText className="w-4 h-4 text-[#004A8F] mt-0.5 shrink-0" />
                       <div>
                         <div className="text-xs font-mono text-slate-500">
-                          {ev.tipo} · {formatDateBR(ev.data)}
+                          {rotuloTipo} · {formatDateBR(ev.data)}
                         </div>
                         <div className="text-sm font-medium text-slate-900 mt-0.5">
                           {ev.descricao}
