@@ -10,6 +10,7 @@ import { formatDateBR } from '../../utils/engineering';
 export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
   const { addNcEvidencia, updateNcEvidencia, deleteNcEvidencia } = useFiscalStore();
   const [tipo, setTipo] = useState<TipoEvidencia>('FOTO');
+  const [tipoPersonalizado, setTipoPersinalizado] = useState('');
   const [descricao, setDescricao] = useState('');
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [saving, setSaving] = useState(false);
@@ -98,7 +99,7 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
               onChange={(e) => setTipo(e.target.value as TipoEvidencia)}
               className="w-full px-3 py-2 text-sm bg-white border border-slate-300 rounded-md"
             >
-              {(['FOTO', 'VIDEO', 'PDF', 'ATA', 'OFICIO', 'MEMORIAL'] as const).map((t) => (
+              {(['FOTO', 'VIDEO', 'PDF', 'ATA', 'OFICIO', 'MEMORIAL', 'OUTROS'] as const).map((t) => (
                 <option key={t} value={t}>
                   {t}
                 </option>
@@ -164,7 +165,7 @@ export default function EvidenciasSection({ nc }: { nc: NaoConformidade }) {
                           onChange={(e) => setEditTipo(e.target.value as TipoEvidencia)}
                           className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md"
                         >
-                          {(['FOTO', 'VIDEO', 'PDF', 'ATA', 'OFICIO', 'MEMORIAL'] as const).map(
+                          {(['FOTO', 'VIDEO', 'PDF', 'ATA', 'OFICIO', 'MEMORIAL', 'OUTROS'] as const).map(
                             (t) => (
                               <option key={t} value={t}>
                                 {t}
